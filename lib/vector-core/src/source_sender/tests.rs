@@ -5,8 +5,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::{Duration as StdDuration, Instant};
-use tokio::time::timeout;
+use std::time::Duration as StdDuration;
+use tokio::time::{Instant, timeout};
 use vrl::event_path;
 
 use super::*;
@@ -55,14 +55,18 @@ async fn emit_and_test(make_event: impl FnOnce(DateTime<Utc>) -> Event) {
     let (mut sender, _stream) = SourceSender::new_test();
     let millis = rng().random_range(10..10000);
     let timestamp = Utc::now() - Duration::milliseconds(millis);
-    #[expect(clippy::cast_precision_loss)]
-    let expected = millis as f64 / 1000.0;
 
     let event = make_event(timestamp);
     sender
         .send_event(event)
         .await
         .expect("Send should not fail");
+
+    // The lag is measured in whole milliseconds at some point during the send, so it is at least
+    // the lag we started with and at most the lag observed once the send has finished.
+    let max_millis = Utc::now().timestamp_millis() - timestamp.timestamp_millis();
+    #[expect(clippy::cast_precision_loss)]
+    let (min_lag, max_lag) = (millis as f64 / 1000.0, max_millis as f64 / 1000.0);
 
     let lag_times = Controller::get()
         .expect("There must be a controller")
@@ -79,21 +83,17 @@ async fn emit_and_test(make_event: impl FnOnce(DateTime<Utc>) -> Event) {
             count,
             sum,
         } => {
-            let mut done = false;
-            for bucket in buckets {
-                if !done && bucket.upper_limit >= expected {
-                    assert_eq!(bucket.count, 1);
-                    done = true;
-                } else {
-                    assert_eq!(bucket.count, 0);
-                }
-            }
             assert_eq!(*count, 1);
             assert!(
-                (*sum - expected).abs() <= 0.002,
-                "Histogram sum does not match expected sum: {} vs {expected}",
+                (min_lag..=max_lag).contains(sum),
+                "Histogram sum {} is outside of the expected range {min_lag}..={max_lag}",
                 *sum,
             );
+            let expected_bucket = buckets.iter().position(|bucket| bucket.upper_limit >= *sum);
+            for (index, bucket) in buckets.iter().enumerate() {
+                let expected_count = u64::from(Some(index) == expected_bucket);
+                assert_eq!(bucket.count, expected_count, "bucket {index}");
+            }
         }
         _ => panic!("source_lag_time_seconds has invalid type"),
     }
@@ -174,7 +174,8 @@ async fn emits_component_discarded_events_total_for_send_batch() {
     );
 }
 
-#[tokio::test]
+// Paused time makes the elapsed-time bounds deterministic regardless of machine load.
+#[tokio::test(start_paused = true)]
 async fn times_out_send_event_with_timeout() {
     metrics::init_test();
 
