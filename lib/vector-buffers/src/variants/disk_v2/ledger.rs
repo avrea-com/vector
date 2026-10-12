@@ -1,11 +1,12 @@
 use std::{
+    collections::HashSet,
     fmt, io, mem,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytecheck::CheckBytes;
@@ -36,6 +37,15 @@ use crate::buffer_usage_data::BufferUsageHandle;
 
 pub const LEDGER_LEN: usize = align16(mem::size_of::<ArchivedLedgerState>());
 
+/// How long to wait for this process to release a buffer lock it still holds.
+const IN_PROCESS_LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Paths of the buffer lock files currently held by this process.
+static HELD_LOCKS: LazyLock<std::sync::Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
+
+/// Notified whenever this process releases a buffer lock.
+static LOCK_RELEASED: LazyLock<Notify> = LazyLock::new(Notify::new);
+
 /// Error that occurred during calls to [`Ledger`].
 #[derive(Debug, Snafu)]
 pub enum LedgerLoadCreateError {
@@ -53,6 +63,9 @@ pub enum LedgerLoadCreateError {
     /// Advisory locking is used to prevent other Vector processes from concurrently opening the
     /// same buffer, but bear in mind that this does not prevent other processes or users from
     /// modifying the ledger file in a way that could cause undefined behavior during buffer operation.
+    ///
+    /// This is also returned if a previous instance of the buffer in this process does not release
+    /// the lock in time.
     #[snafu(display(
         "failed to lock buffer.lock; is another Vector process running and using this buffer?"
     ))]
@@ -244,6 +257,60 @@ impl ArchivedLedgerState {
     }
 }
 
+/// Advisory lock for a buffer directory, tracked so that this process can wait for its own release.
+///
+/// A buffer is unlocked only once its ledger is dropped, which can lag behind the sink using it:
+/// background tasks such as the finalizer hold the ledger until they observe the reader and
+/// writer going away. Without waiting, recreating the buffer during a configuration reload fails
+/// intermittently.
+struct BufferLock {
+    lock: LockFile,
+    path: PathBuf,
+}
+
+impl BufferLock {
+    /// Acquires the lock at `path`.
+    ///
+    /// If this process already holds the lock, waits for it to be released. If another process
+    /// holds the lock, fails immediately.
+    async fn acquire(path: PathBuf) -> Result<Self, LedgerLoadCreateError> {
+        let mut lock = LockFile::open(&path).context(IoSnafu)?;
+        let deadline = tokio::time::Instant::now() + IN_PROCESS_LOCK_RELEASE_TIMEOUT;
+        loop {
+            // Register for the release notification before checking, so a release between the
+            // check and the wait is not missed.
+            let released = LOCK_RELEASED.notified();
+            {
+                let mut held = HELD_LOCKS.lock().expect("buffer lock registry poisoned");
+                if lock.try_lock().context(IoSnafu)? {
+                    held.insert(path.clone());
+                    return Ok(Self { lock, path });
+                }
+                if !held.contains(&path) {
+                    return Err(LedgerLoadCreateError::LedgerLockAlreadyHeld);
+                }
+            }
+            debug!(path = %path.display(), "Waiting for previous buffer instance to release its lock.");
+            if tokio::time::timeout_at(deadline, released).await.is_err() {
+                return Err(LedgerLoadCreateError::LedgerLockAlreadyHeld);
+            }
+        }
+    }
+}
+
+impl Drop for BufferLock {
+    fn drop(&mut self) {
+        {
+            let mut held = HELD_LOCKS.lock().expect("buffer lock registry poisoned");
+            if let Err(error) = self.lock.unlock() {
+                warn!(%error, path = %self.path.display(), "Failed to release buffer lock.");
+            }
+            held.remove(&self.path);
+        }
+        LOCK_RELEASED.notify_waiters();
+    }
+}
+
 /// Tracks the internal state of the buffer.
 pub(crate) struct Ledger<FS>
 where
@@ -253,7 +320,7 @@ where
     config: DiskBufferConfig<FS>,
     // Advisory lock for this buffer directory.
     #[allow(dead_code)]
-    lock: LockFile,
+    lock: BufferLock,
     // Ledger state.
     state: BackedArchive<FS::MutableMemoryMap, LedgerState>,
     // The total size, in bytes, of all unread records in the buffer.
@@ -763,11 +830,7 @@ where
         // TODO: It'd be nice to incorporate this within `Filesystem` to fully encapsulate _all_
         // file I/O, but the code is so specific, including the drop guard for the lock file, that I
         // don't know if it's worth it.
-        let ledger_lock_path = config.data_dir.join("buffer.lock");
-        let mut lock = LockFile::open(&ledger_lock_path).context(IoSnafu)?;
-        if !lock.try_lock().context(IoSnafu)? {
-            return Err(LedgerLoadCreateError::LedgerLockAlreadyHeld);
-        }
+        let lock = BufferLock::acquire(config.data_dir.join("buffer.lock")).await?;
 
         // Open the ledger file, which may involve creating it if it doesn't yet exist.
         let ledger_path = config.data_dir.join("buffer.db");
