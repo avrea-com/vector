@@ -17,7 +17,7 @@ impl AtomicF64 {
         f64::from_bits(self.0.load(order))
     }
 
-    #[expect(clippy::missing_panics_doc, reason = "fetch_update always succeeds")]
+    #[expect(clippy::missing_panics_doc, reason = "try_update always succeeds")]
     pub fn fetch_update(
         &self,
         set_order: Ordering,
@@ -26,10 +26,10 @@ impl AtomicF64 {
     ) -> f64 {
         f64::from_bits(
             self.0
-                .fetch_update(set_order, fetch_order, |x| {
+                .try_update(set_order, fetch_order, |x| {
                     Some(f(f64::from_bits(x)).to_bits())
                 })
-                .expect("fetch_update always succeeds"),
+                .expect("try_update always succeeds"),
         )
     }
 }
